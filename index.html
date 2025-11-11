@@ -1,37 +1,651 @@
 <html>
-  <head>
-    <title>PixelX - 3D Maze Explorer</title>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 
-    <!-- External Stylesheets -->
-    <link rel="stylesheet" href="styles.css" />
+    <head>
+    
+        <script src='Box2dWeb.min.js'></script>
+        <script src="Three.js"></script>
+        <script src="keyboard.js"></script>
+        <script src="jquery.js"></script>
+        <script src="maze.js"></script>
 
-    <!-- External JavaScript Libraries -->
-    <script src="Three.js"></script>
-    <script src="jquery.js"></script>
-    <script src="maze.js"></script>
+        <script>
 
-    <!-- Game Logic -->
-    <script src="game.js"></script>
-  </head>
+            var camera         = undefined, 
+                scene          = undefined, 
+                renderer       = undefined, 
+                light          = undefined,
+                mouseX         = undefined, 
+                mouseY         = undefined,
+                maze           = undefined, 
+                mazeMesh       = undefined,
+                mazeDimension  = 11,
+                planeMesh      = undefined,
+                ballMesh       = undefined,
+                ballRadius     = 0.25,
+                keyAxis        = [0, 0],
+                ironTexture    = THREE.ImageUtils.loadTexture('/ball.png'),
+                planeTexture   = THREE.ImageUtils.loadTexture('/concrete.png'),
+                brickTexture   = THREE.ImageUtils.loadTexture('/brick.png'),
+                gameState      = undefined,
+                minimapCanvas  = undefined,
+                minimapContext = undefined,
+                minimapCellSize = undefined,
 
-  <body>
-    <div id="instructions">
-      PixelX - 3D Maze Explorer:
-      <br /><br />
-      Use the control buttons to change ball position and lighting.
-      <br /><br />
-      Interactive 3D maze environment
+            // Trail system variables
+                trailParticles = [],
+                maxTrailParticles = 50,
+                lastTrailPosition = null,
+                trailSpawnDistance = 0.1,
+                trailFadeDuration = 2.0,
+                goldenParticleTexture = undefined,
+
+            // Box2D shortcuts
+                b2World        = Box2D.Dynamics.b2World,
+                b2FixtureDef   = Box2D.Dynamics.b2FixtureDef,
+                b2BodyDef      = Box2D.Dynamics.b2BodyDef,
+                b2Body		   = Box2D.Dynamics.b2Body,
+                b2CircleShape  = Box2D.Collision.Shapes.b2CircleShape,
+                b2PolygonShape = Box2D.Collision.Shapes.b2PolygonShape,
+                b2Settings     = Box2D.Common.b2Settings,
+                b2Vec2         = Box2D.Common.Math.b2Vec2,
+
+            // Box2D world variables 
+                wWorld         = undefined,
+                wBall          = undefined;
+
+            
+            function createGoldenParticleTexture() {
+                // Create a canvas for the particle texture
+                var canvas = document.createElement('canvas');
+                canvas.width = 64;
+                canvas.height = 64;
+                var ctx = canvas.getContext('2d');
+                
+                // Create circular gradient from golden center to transparent edges
+                var gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+                gradient.addColorStop(0, 'rgba(255, 215, 0, 1.0)');    // Golden center (#FFD700)
+                gradient.addColorStop(0.5, 'rgba(255, 215, 0, 0.5)');  // Semi-transparent mid
+                gradient.addColorStop(1, 'rgba(255, 215, 0, 0.0)');    // Transparent edges
+                
+                // Draw the gradient circle
+                ctx.fillStyle = gradient;
+                ctx.fillRect(0, 0, 64, 64);
+                
+                // Create THREE.js texture from canvas
+                var texture = new THREE.Texture(canvas);
+                texture.needsUpdate = true;
+                
+                return texture;
+            }
+
+
+            function createTrailParticle(x, y, z) {
+                // Create a simple plane geometry for the particle
+                var geometry = new THREE.PlaneGeometry(0.3, 0.3);
+                
+                // Create material with golden texture
+                var material = new THREE.MeshBasicMaterial({
+                    map: goldenParticleTexture,
+                    transparent: true,
+                    blending: THREE.AdditiveBlending,
+                    opacity: 1.0,
+                    side: THREE.DoubleSide
+                });
+                
+                // Create mesh
+                var mesh = new THREE.Mesh(geometry, material);
+                mesh.position.set(x, y, 0.05);  // Position at ground level (z = 0.05)
+                mesh.rotation.x = Math.PI / 2;  // Rotate to lay flat on ground
+                
+                // Return particle object with mesh, age, and maxAge
+                return {
+                    mesh: mesh,
+                    age: 0,
+                    maxAge: 2.0
+                };
+            }
+
+
+            function createPhysicsWorld() {
+                // Create the world object.
+                wWorld = new b2World(new b2Vec2(0, 0), true);
+
+                // Create the ball.
+                var bodyDef = new b2BodyDef();
+                bodyDef.type = b2Body.b2_dynamicBody;
+                bodyDef.position.Set(1, 1);
+                wBall = wWorld.CreateBody(bodyDef);
+                var fixDef = new b2FixtureDef();
+                fixDef.density = 1.0;
+                fixDef.friction = 0.0;
+                fixDef.restitution = 0.25;
+                fixDef.shape = new b2CircleShape(ballRadius);
+                wBall.CreateFixture(fixDef);
+
+                // Create the maze.
+                bodyDef.type = b2Body.b2_staticBody;
+                fixDef.shape = new b2PolygonShape();
+                fixDef.shape.SetAsBox(0.5, 0.5);
+                for (var i = 0; i < maze.dimension; i++) {
+                    for (var j = 0; j < maze.dimension; j++) {
+                        if (maze[i][j]) {
+                            bodyDef.position.x = i;
+                            bodyDef.position.y = j;
+                            wWorld.CreateBody(bodyDef).CreateFixture(fixDef);
+                        }
+                    }
+                }
+            }
+            
+            
+            function generate_maze_mesh(field) {
+                var dummy = new THREE.Geometry();
+                for (var i = 0; i < field.dimension; i++) {
+                    for (var j = 0; j < field.dimension; j++) {
+                        if (field[i][j]) {
+                            var geometry = new THREE.CubeGeometry(1,1,1,1,1,1);
+                            var mesh_ij = new THREE.Mesh(geometry);
+                            mesh_ij.position.x = i;
+                            mesh_ij.position.y = j;
+                            mesh_ij.position.z = 0.5;
+                            THREE.GeometryUtils.merge(dummy, mesh_ij);
+                        }
+                    }
+                }
+                var material = new THREE.MeshPhongMaterial({map: brickTexture});
+                var mesh = new THREE.Mesh(dummy, material)
+                return mesh;
+            }
+
+
+            function createRenderWorld() {
+
+                // Create the scene object.
+                scene = new THREE.Scene();
+
+                // Add the light.
+                light= new THREE.PointLight(0xffffff, 1);
+                light.position.set(1, 1, 1.3);
+                scene.add(light);
+                
+                // Add the ball.
+                g = new THREE.SphereGeometry(ballRadius, 32, 16);
+                m = new THREE.MeshPhongMaterial({map:ironTexture});
+                ballMesh = new THREE.Mesh(g, m);
+                ballMesh.position.set(1, 1, ballRadius);
+                scene.add(ballMesh);
+
+                // Add the camera.
+                var aspect = window.innerWidth/window.innerHeight;
+                camera = new THREE.PerspectiveCamera(60, aspect, 1, 1000);
+                camera.position.set(1, 1, 5);
+                scene.add(camera);
+
+                // Add the maze.
+                mazeMesh = generate_maze_mesh(maze);
+                scene.add(mazeMesh);
+
+                // Add the ground.
+                g = new THREE.PlaneGeometry(mazeDimension*10, mazeDimension*10, mazeDimension, mazeDimension);
+                planeTexture.wrapS = planeTexture.wrapT = THREE.RepeatWrapping;
+                planeTexture.repeat.set(mazeDimension*5, mazeDimension*5);
+                m = new THREE.MeshPhongMaterial({map:planeTexture});
+                planeMesh = new THREE.Mesh(g, m);
+                planeMesh.position.set((mazeDimension-1)/2, (mazeDimension-1)/2, 0);
+                planeMesh.rotation.set(Math.PI/2, 0, 0);
+                scene.add(planeMesh);                
+
+            }
+
+
+            function updatePhysicsWorld() {
+
+                // Apply "friction". 
+                var lv = wBall.GetLinearVelocity();
+                lv.Multiply(0.95);
+                wBall.SetLinearVelocity(lv);
+                
+                // Apply user-directed force.
+                var f = new b2Vec2(keyAxis[0]*wBall.GetMass()*0.25, keyAxis[1]*wBall.GetMass()*0.25);
+                wBall.ApplyImpulse(f, wBall.GetPosition());          
+                keyAxis = [0,0];
+
+                // Take a time step.
+                wWorld.Step(1/60, 8, 3);
+            }
+            
+
+            function updateRenderWorld() {
+
+                // Update ball position.
+                var stepX = wBall.GetPosition().x - ballMesh.position.x;
+                var stepY = wBall.GetPosition().y - ballMesh.position.y;
+                ballMesh.position.x += stepX;
+                ballMesh.position.y += stepY;
+
+                // Update ball rotation.
+                var tempMat = new THREE.Matrix4();
+                tempMat.makeRotationAxis(new THREE.Vector3(0,1,0), stepX/ballRadius);
+                tempMat.multiplySelf(ballMesh.matrix);
+                ballMesh.matrix = tempMat;
+                tempMat = new THREE.Matrix4();
+                tempMat.makeRotationAxis(new THREE.Vector3(1,0,0), -stepY/ballRadius);
+                tempMat.multiplySelf(ballMesh.matrix);
+                ballMesh.matrix = tempMat;
+                ballMesh.rotation.getRotationFromMatrix(ballMesh.matrix);
+                
+                // Update camera and light positions.
+                camera.position.x += (ballMesh.position.x - camera.position.x) * 0.1;
+                camera.position.y += (ballMesh.position.y - camera.position.y) * 0.1;
+                camera.position.z += (5 - camera.position.z) * 0.1;
+                light.position.x = camera.position.x;
+                light.position.y = camera.position.y;
+                light.position.z = camera.position.z - 3.7;
+                
+                // Trail particle spawning logic
+                if (ballMesh && goldenParticleTexture) {
+                    // Calculate distance from last trail position
+                    if (lastTrailPosition === null) {
+                        // Initialize lastTrailPosition on first call
+                        lastTrailPosition = {
+                            x: ballMesh.position.x,
+                            y: ballMesh.position.y
+                        };
+                    } else {
+                        var dx = ballMesh.position.x - lastTrailPosition.x;
+                        var dy = ballMesh.position.y - lastTrailPosition.y;
+                        var distance = Math.sqrt(dx * dx + dy * dy);
+                        
+                        // Spawn particle if ball has moved enough
+                        if (distance >= trailSpawnDistance) {
+                            // Create new particle at ball's current position
+                            var particle = createTrailParticle(
+                                ballMesh.position.x,
+                                ballMesh.position.y,
+                                0.05
+                            );
+                            
+                            // Implement buffer management - remove oldest if at capacity
+                            if (trailParticles.length >= maxTrailParticles) {
+                                var oldestParticle = trailParticles.shift();
+                                scene.remove(oldestParticle.mesh);
+                            }
+                            
+                            // Add particle to array and scene
+                            trailParticles.push(particle);
+                            scene.add(particle.mesh);
+                            
+                            // Update last trail position
+                            lastTrailPosition.x = ballMesh.position.x;
+                            lastTrailPosition.y = ballMesh.position.y;
+                        }
+                    }
+                }
+                
+                // Particle aging and fade-out system
+                var deltaTime = 1/60; // 60fps frame rate
+                for (var i = trailParticles.length - 1; i >= 0; i--) {
+                    var particle = trailParticles[i];
+                    
+                    // Increment particle age
+                    particle.age += deltaTime;
+                    
+                    // Calculate and update opacity
+                    var opacity = 1.0 - (particle.age / particle.maxAge);
+                    particle.mesh.material.opacity = opacity;
+                    
+                    // Remove particle if it has exceeded maxAge
+                    if (particle.age >= particle.maxAge) {
+                        scene.remove(particle.mesh);
+                        trailParticles.splice(i, 1);
+                    }
+                }
+            }
+
+
+            function clearTrailParticles() {
+                // Remove all particle meshes from scene
+                for (var i = 0; i < trailParticles.length; i++) {
+                    scene.remove(trailParticles[i].mesh);
+                }
+                
+                // Clear the trailParticles array
+                trailParticles = [];
+                
+                // Reset lastTrailPosition to prevent stale position references
+                lastTrailPosition = null;
+            }
+
+
+            function gameLoop() {
+            
+                switch(gameState) {
+                
+                    case 'initialize':
+                        maze = generateSquareMaze(mazeDimension);
+                        maze[mazeDimension-1][mazeDimension-2] = false;
+                        
+                        // Create golden particle texture once if not already created
+                        if (goldenParticleTexture === undefined) {
+                            goldenParticleTexture = createGoldenParticleTexture();
+                        }
+                        
+                        createPhysicsWorld();
+                        createRenderWorld();
+                        initializeMinimap();
+                        camera.position.set(1, 1, 5);
+                        light.position.set(1, 1, 1.3);
+                        light.intensity = 0;
+                        var level = Math.floor((mazeDimension-1)/2 - 4);
+                        $('#level').html('Level ' + level);
+                        gameState = 'fade in';
+                        break;
+                        
+                    case 'fade in':
+                        light.intensity += 0.1 * (1.0 - light.intensity);
+                        renderer.render(scene, camera);
+                        if (Math.abs(light.intensity - 1.0) < 0.05) {
+                            light.intensity = 1.0;
+                            gameState = 'play'
+                        }
+                        break;
+
+                    case 'play':
+                        updatePhysicsWorld();
+                        updateRenderWorld();
+                        renderMinimap();
+                        renderer.render(scene, camera);
+
+                        // Check for victory.
+                        var mazeX = Math.floor(ballMesh.position.x + 0.5);
+                        var mazeY = Math.floor(ballMesh.position.y + 0.5);
+                        if (mazeX == mazeDimension && mazeY == mazeDimension - 2) { 
+                            mazeDimension += 2;
+                            gameState = 'fade out';
+                        }
+                        break;
+                
+                    case 'fade out':
+                        updatePhysicsWorld();
+                        updateRenderWorld();
+                        light.intensity += 0.1 * (0.0 - light.intensity);
+                        renderer.render(scene, camera);
+                        if (Math.abs(light.intensity - 0.0) < 0.1) {
+                            light.intensity = 0.0;
+                            renderer.render(scene, camera);
+                            clearTrailParticles();
+                            gameState = 'initialize'
+                        }
+                        break;
+                        
+                }
+            
+                requestAnimationFrame(gameLoop);
+
+            }
+
+
+            function onResize() {
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                camera.aspect = window.innerWidth/window.innerHeight;
+                camera.updateProjectionMatrix();
+            }
+            
+
+            function onMoveKey(axis) {
+                keyAxis = axis.slice(0);
+            }
+
+
+            function initializeMinimap() {
+                // Get canvas and context
+                minimapCanvas = document.getElementById('minimap-canvas');
+                minimapContext = minimapCanvas.getContext('2d');
+                
+                // Calculate cell size based on current mazeDimension
+                minimapCellSize = 150 / mazeDimension;
+            }
+
+
+            function restartLevel() {
+                // Reset ball physics position to (1, 1)
+                wBall.SetPosition(new b2Vec2(1, 1));
+                
+                // Reset ball velocity and angular velocity to zero
+                wBall.SetLinearVelocity(new b2Vec2(0, 0));
+                wBall.SetAngularVelocity(0);
+                
+                // Reset ball mesh position and rotation
+                ballMesh.position.set(1, 1, ballRadius);
+                ballMesh.rotation.set(0, 0, 0);
+                ballMesh.matrix.identity();
+                
+                // Reset camera and light positions to initial state
+                camera.position.set(1, 1, 5);
+                light.position.set(1, 1, 1.3);
+                
+                // Clear trail particles on level restart
+                clearTrailParticles();
+            }
+
+
+            function renderMinimap() {
+                // Clear canvas
+                minimapContext.clearRect(0, 0, 150, 150);
+                
+                // Draw maze walls as white filled rectangles
+                minimapContext.fillStyle = 'white';
+                for (var i = 0; i < maze.dimension; i++) {
+                    for (var j = 0; j < maze.dimension; j++) {
+                        if (maze[i][j]) {
+                            minimapContext.fillRect(
+                                i * minimapCellSize,
+                                (mazeDimension - 1 - j) * minimapCellSize,
+                                minimapCellSize,
+                                minimapCellSize
+                            );
+                        }
+                    }
+                }
+                
+                // Draw exit location as lime green rectangle
+                var exitX = (mazeDimension - 1) * minimapCellSize;
+                var exitY = (mazeDimension - 1 - (mazeDimension - 2)) * minimapCellSize;
+                minimapContext.fillStyle = 'lime';
+                minimapContext.fillRect(exitX, exitY, minimapCellSize, minimapCellSize);
+                
+                // Draw ball position as red circle indicator
+                var ballX = (ballMesh.position.x - 0.5) * minimapCellSize + minimapCellSize / 2 + 0.5 * minimapCellSize;
+                var ballY = (mazeDimension - 1 - (ballMesh.position.y - 0.5)) * minimapCellSize - minimapCellSize / 2 + 0.5 * minimapCellSize;
+                minimapContext.fillStyle = 'red';
+                minimapContext.beginPath();
+                minimapContext.arc(ballX, ballY, minimapCellSize * 0.4, 0, Math.PI * 2);
+                minimapContext.fill();
+            }
+
+            
+            jQuery.fn.centerv = function () {
+                wh = window.innerHeight;
+                h = this.outerHeight();
+                this.css("position", "absolute");
+                this.css("top", Math.max(0, (wh - h)/2) + "px");
+                return this;
+            }            
+
+            
+            jQuery.fn.centerh = function () {
+                ww = window.innerWidth;
+                w = this.outerWidth();
+                this.css("position", "absolute");
+                this.css("left", Math.max(0, (ww - w)/2) + "px");
+                return this;
+            }            
+
+            
+            jQuery.fn.center = function () {
+                this.centerv();
+                this.centerh();
+                return this;
+            }            
+
+            
+            $(document).ready(function() {
+
+                // Prepare the instructions.
+                $('#instructions').center();
+                $('#instructions').hide();
+                KeyboardJS.bind.key('i', function(){$('#instructions').show()}, 
+                                         function(){$('#instructions').hide()});
+    
+                // Create the renderer.
+                renderer = new THREE.WebGLRenderer();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                document.body.appendChild(renderer.domElement);
+
+                // Bind keyboard and resize events.
+                KeyboardJS.bind.axis('left', 'right', 'down', 'up', onMoveKey);
+                KeyboardJS.bind.axis('h', 'l', 'j', 'k', onMoveKey);
+                $(window).resize(onResize);
+                
+                // Bind restart button click event.
+                $('#restart-button').click(restartLevel);
+
+                // Set the initial game state.
+                gameState = 'initialize';
+                
+                // Start the game loop.
+                requestAnimationFrame(gameLoop);
+
+            })
+            
+            
+
+        </script>
+    
+        <style>
+        
+            body {
+                background: black;
+                margin: 0;
+                padding: 0;
+                font-family: 'Helvetica';
+            }
+            
+            #instructions {
+                background-color: rgba(0,0,0,0.75);
+                color: white;
+                text-align: center;
+                padding: 32px;
+                margin: 0px;
+                display: inline;
+                border: 2px solid white;
+            }
+
+            #help {
+                position: absolute;
+                left: 0px;
+                bottom: 0px;
+                padding: 4px;
+                color: white;   
+            }
+
+            #level {
+                position: absolute;
+                left: 0px;
+                top: 0px;
+                padding: 4px;
+                color: yellow;   
+                font-weight: bold;
+            }
+
+            #restart-button {
+                position: absolute;
+                left: 0px;
+                top: 28px;
+                padding: 10px 16px;
+                background: linear-gradient(135deg, 
+                    rgba(120, 120, 120, 0.9) 0%, 
+                    rgba(80, 80, 80, 0.9) 50%, 
+                    rgba(60, 60, 60, 0.9) 100%);
+                color: #FFD700;
+                border: 3px solid rgba(139, 90, 43, 0.8);
+                border-radius: 4px;
+                cursor: pointer;
+                font-weight: bold;
+                text-align: center;
+                text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.8);
+                box-shadow: 
+                    0 4px 8px rgba(0, 0, 0, 0.6),
+                    inset 0 1px 0 rgba(255, 255, 255, 0.2),
+                    inset 0 -1px 0 rgba(0, 0, 0, 0.4);
+                transition: all 0.2s ease;
+            }
+
+            #restart-button:hover {
+                background: linear-gradient(135deg, 
+                    rgba(139, 90, 43, 0.9) 0%, 
+                    rgba(120, 80, 40, 0.9) 50%, 
+                    rgba(100, 70, 35, 0.9) 100%);
+                border-color: rgba(180, 120, 60, 0.9);
+                color: #FFF;
+                box-shadow: 
+                    0 6px 12px rgba(0, 0, 0, 0.8),
+                    inset 0 1px 0 rgba(255, 255, 255, 0.3),
+                    inset 0 -1px 0 rgba(0, 0, 0, 0.5);
+                transform: translateY(-2px);
+            }
+
+            #restart-button:active {
+                transform: translateY(0px);
+                box-shadow: 
+                    0 2px 4px rgba(0, 0, 0, 0.6),
+                    inset 0 1px 0 rgba(0, 0, 0, 0.3);
+            }
+
+            #minimap-container {
+                position: absolute;
+                left: 0px;
+                bottom: 28px;
+                padding: 8px;
+                background-color: rgba(0,0,0,0.75);
+                border: 2px solid white;
+            }
+
+            #minimap-canvas {
+                display: block;
+            }
+
+        </style>
+        
+    </head>
+    
+    <body>
+    
+    <div id='instructions'>
+        How to play PixelX Maze Game:
+        <br><br>
+        Use the arrow keys to move the ball and find the exit to the maze.
+        <br><br>
+        Vim trainees: h, j, k, l
+    </div>
+    
+    <div id='help'>
+        Hold down the 'I' key for instructions.
     </div>
 
-    <div id="help">Hold down the 'I' key for instructions.</div>
-
-    <div id="level">PixelX</div>
-
-    <div id="controls">
-      <button id="lightToggle">Toggle Lighting</button>
-      <button id="positionChange">Change Ball Position</button>
+    <div id='level'>
+        Level 1
     </div>
-  </body>
+
+    <div id='restart-button'>
+        Restart Level
+    </div>
+
+    <div id='minimap-container'>
+        <canvas id='minimap-canvas' width='150' height='150'></canvas>
+    </div>
+    
+    </body>
+
 </html>
+
